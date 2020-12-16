@@ -4,13 +4,14 @@ from __future__ import print_function
 
 import tensorflow as tf
 import numpy as np
+from tensorflow.python.ops.gen_math_ops import Inv
 from learning.model_vanilla import ModelVani
 from utils import match_loss, triplet_loss_adversarial
 from time import time
 # from utils_folder.save_drebin import project_to_manifest
 from utils import reshape_cal_len
 import dataloader.cifar10_input
-
+from ..adversarial_invariance.invariance_generator import InvarianceGenerator
 
 class LinfPGDAttackGPUImg:
     def __init__(self, model_VarList, model, epsilon, num_steps, step_size, random_start, dataset_type, config):
@@ -44,6 +45,13 @@ class LinfPGDAttackGPUImg:
                            mask_effective_attack=config['mask_effective_attack'])
 
         self.Ap_emb = reshape_cal_len(layer_values_Ap_emb['x4'])[0]
+        self.invariance_generator = InvarianceGenerator()
+
+    def fit(self, X, y):
+        self.invariance_generator.fit(X, y)
+    
+    def invariance(self, x_batch, y_batch):
+        return tf.map_fn(tf.stack([x_batch, y_batch], 1), lambda x: self.invariance_generator(x[0], y[0]))
 
     def perturb(self, x_batch, y_batch, mode, sess):
 
