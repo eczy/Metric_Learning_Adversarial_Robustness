@@ -84,7 +84,6 @@
 
   "strong_attack": [100, 0.01],
 
-  "use_invariance_attack": true,
   "invariance_lambda": 0.5
 }
 

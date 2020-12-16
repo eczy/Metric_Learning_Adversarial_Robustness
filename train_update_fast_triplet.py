@@ -30,6 +30,7 @@ slim = tf.contrib.slim
 # Parse input parameters
 parser = argparse.ArgumentParser(description='Train Triplet')
 parser.add_argument('--dataset', dest='dataset', type=str, default='mnist', help='dataset to use')
+parser.add_argument('--use_invariance', action='store_true', help='use invariance attacks for TLA')
 parser.add_argument('--gpu', dest='gpu', type=int, default=1, help='num of gpus to use')
 parser.add_argument('--model-dir-postfix', dest='model_dir_postfix', type=str, default='', help='postfix added to directory holding the log')
 parser.add_argument('--train-size', dest='train_size', type=int, default=None, help='')
@@ -41,7 +42,9 @@ parser.add_argument('--use_lipschitz', action='store_true', help='use Lipschitz 
 
 
 args = parser.parse_args()
+use_invariance_attack = args.use_invariance
 
+print("***USING INVARIANCE ATTACKS: {} ***".format(use_invariance_attack))
 assert not (args.diff_neg and args.random_negative)
 
 config = None
@@ -100,7 +103,7 @@ print('margin_mul', margin_mul)
 
 
 # configs for invariance
-use_invariance_attack = config["use_invariance_attack"]
+# use_invariance_attack = config["use_invariance_attack"]
 lamda_invariance = config["invariance_lambda"]
 
 # Note: current config set these parameters to be the same across layers. However, they can be customized for different layers.
@@ -192,6 +195,7 @@ if Use_A1_Ap_B:
 if Use_B_Bp_A:
     sub_folder_name += 'B_Bp_A'
 sub_folder_name += '_' + str(args.train_size)
+sub_folder_name += '_' + str(use_invariance_attack)
 model_dir = os.path.join(model_dir, sub_folder_name)
 
 
@@ -303,8 +307,10 @@ if Use_B_Bp_A:
     model._encoder(x_Badv, y_Binput, is_training)
 
 # # A'' - invariance data
-layer_values_Ap_invar, a_Axent_invar, a_Amean_xent_invar, a_Aweight_decay_loss_invar, a_Anum_correct_invar, a_Aaccuracy_invar, a_Apredict_invar, a_Amask_invar = \
-    model._encoder(x_Aadv_invar, y_Ainput_invar, is_training, mask_effective_attack=config['mask_effective_attack']) #TODO: check this
+
+if use_invariance_attack:
+    layer_values_Ap_invar, a_Axent_invar, a_Amean_xent_invar, a_Aweight_decay_loss_invar, a_Anum_correct_invar, a_Aaccuracy_invar, a_Apredict_invar, a_Amask_invar = \
+        model._encoder(x_Aadv_invar, y_Ainput_invar, is_training, mask_effective_attack=config['mask_effective_attack']) #TODO: check this
 
 # A1, A2, ...
 if Use_A1_Ap_B:
@@ -409,7 +415,8 @@ for layer_name in triplet_loss_layers:
 model_var_B_Bp_A = x_Anat, y_Ainput, x_Bnat, layer_values_A['x4'], layer_values_A['pre_softmax'], layer_values_B['x4'], layer_values_B['pre_softmax'], is_training
 model_var_attack = x_Aadv, a_Axent, y_Ainput, is_training, a_Aaccuracy
 
-model_invariance_attack = x_Aadv_invar, a_Axent_invar, y_Ainput_invar, is_training, a_Aaccuracy_invar # TODO add?
+if use_invariance_attack:
+    model_invariance_attack = x_Aadv_invar, a_Axent_invar, y_Ainput_invar, is_training, a_Aaccuracy_invar # TODO add?
 # model_var = n_Anum_correct, n_Axent, a_Anum_correct, a_Axent, x_Anat, x_Aadv, y_Ainput, is_training
 
 
@@ -539,9 +546,10 @@ FGSM = LinfPGDAttack(model_var_attack,
                        )  # TODO: without momentum
 
 
-model_VarList = x_Aadv_invar, x_Aadv_attack_invar, y_Ainput_invar, is_training
-attack_gpu_invar = InvarianceGPUAttack(model_VarList, model, config['epsilon'], config['num_steps'], config['step_size'], config['random_start'], dataset_type, config)
-attack_gpu_invar.fit(X=raw_dataset.train_data.xs, y=raw_dataset.train_data.ys)
+if use_invariance_attack:
+    model_VarList = x_Aadv_invar, x_Aadv_attack_invar, y_Ainput_invar, is_training
+    attack_gpu_invar = InvarianceGPUAttack(model_VarList, model, config['epsilon'], config['num_steps'], config['step_size'], config['random_start'], dataset_type, config)
+    attack_gpu_invar.fit(X=raw_dataset.train_data.xs, y=raw_dataset.train_data.ys)
 
 # import pdb; pdb.set_trace();
 
@@ -936,8 +944,10 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
                                         False, fp, dataset_type, attack_test=attack_strong)
 
 
-        adv_acc_invariant = eval_in_train_vanilla(config, model_var, raw_dataset, sess, global_step, test_summary_writer_invar,
-                                        False, fp, dataset_type, attack_test=attack_gpu_invar) #TODO: check that this is okay, and not another class needed
+        if use_invariance_attack: 
+            print('-' * 10, 'Invariance Attack', '-' * 10)
+            adv_acc_invariant = eval_in_train_vanilla(config, model_var, raw_dataset, sess, global_step, test_summary_writer_invar,
+                                        False, fp, dataset_type, attack_test=attack_gpu_invar, use_invariance_attack=True) #TODO: check that this is okay, and not another class needed
 
         print("model dir", model_dir)
         try:
