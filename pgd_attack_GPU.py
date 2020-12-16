@@ -51,7 +51,7 @@ class LinfPGDAttackGPUImg:
         self.invariance_generator.fit(X, y)
     
     def invariance(self, x_batch, y_batch):
-        return tf.map_fn(tf.stack([x_batch, y_batch], 1), lambda x: self.invariance_generator(x[0], x[0]))
+        return tf.map_fn(tf.stack([x_batch, y_batch], 1), lambda x: self.invariance_generator.invariance_attack(x[0], x[0]))
 
     def perturb(self, x_batch, y_batch, mode, sess):
 
