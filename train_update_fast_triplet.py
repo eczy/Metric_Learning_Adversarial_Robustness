@@ -17,6 +17,7 @@ from learning.model_mnist_large import ModelMNIST
 from learning.model_imagenet_res50 import ModelImagenet
 
 from pgd_attack import LinfPGDAttack, TargetedGen
+from pgd_attack_GPU import LinfPGDAttackGPUImg, InvarianceGPUAttack
 from utils import trainable_in, remove_duplicate_node_from_list, triplet_loss_dict, visualize_imgs, mse_loss, \
     reshape_cal_len, compute_vector_dist_toall_except_own
 from learning.eval_within_train import eval_in_train_vanilla
@@ -271,6 +272,7 @@ with tf.variable_scope('input'):
 
     if use_invariance_attack:
         x_Aadv_invar = tf.placeholder(precision, shape=input_shape)
+        x_Aadv_attack_invar = tf.placeholder(precision, shape=input_shape)
         y_Ainput_invar = tf.placeholder(tf.int64, shape=None)
 
         assert Use_A1_Ap_B # other triplet loss used in parallel
@@ -301,8 +303,8 @@ if Use_B_Bp_A:
     model._encoder(x_Badv, y_Binput, is_training)
 
 # # A'' - invariance data
-# layer_values_Ap_invar, a_Axent_invar, a_Amean_xent_invar, a_Aweight_decay_loss_invar, a_Anum_correct_invar, a_Aaccuracy_invar, a_Apredict_invar, a_Amask_invar = \
-#     model._encoder(x_Aadv_invar, y_Ainput_invar, is_training, mask_effective_attack=config['mask_effective_attack'])
+layer_values_Ap_invar, a_Axent_invar, a_Amean_xent_invar, a_Aweight_decay_loss_invar, a_Anum_correct_invar, a_Aaccuracy_invar, a_Apredict_invar, a_Amask_invar = \
+    model._encoder(x_Aadv_invar, y_Ainput_invar, is_training, mask_effective_attack=config['mask_effective_attack']) #TODO: check this
 
 # A1, A2, ...
 if Use_A1_Ap_B:
@@ -379,11 +381,11 @@ for layer_name in triplet_loss_layers:
 
         for i in range(A1_Ap_B_num):
             if switch_an_neg:
-                pos = layer_values_Ap[layer_name]
+                pos = layer_values_Ap_invar[layer_name]
                 anchor = A1_invariance_list[i]['layer_values_A1_invar'][layer_name]  # TODO: Double check this is okay
             else:
                 pos = A1_invariance_list[i]['layer_values_A1_invar'][layer_name]
-                anchor = layer_values_Ap[layer_name]
+                anchor = layer_values_Ap_invar[layer_name]
             neg = layer_values_B[layer_name]
 
             triplet_loss_data_invariance_list[i][layer_name] = triplet_loss_dict(anchor, pos, neg, triplet_loss_type,
@@ -407,10 +409,13 @@ for layer_name in triplet_loss_layers:
 model_var_B_Bp_A = x_Anat, y_Ainput, x_Bnat, layer_values_A['x4'], layer_values_A['pre_softmax'], layer_values_B['x4'], layer_values_B['pre_softmax'], is_training
 model_var_attack = x_Aadv, a_Axent, y_Ainput, is_training, a_Aaccuracy
 
-# model_invariance_attack = x_Aadv_invar, a_Axent_invar, y_Ainput_invar, is_training, a_Aaccuracy_invar # TODO add?
+model_invariance_attack = x_Aadv_invar, a_Axent_invar, y_Ainput_invar, is_training, a_Aaccuracy_invar # TODO add?
 # model_var = n_Anum_correct, n_Axent, a_Anum_correct, a_Axent, x_Anat, x_Aadv, y_Ainput, is_training
 
+
+# TODO: confirm pass in natural examples 
 model_var = n_Anum_correct, n_Axent, x_Anat, y_Ainput, is_training, n_Apredict
+# model_invar = n_Anum_correct, n_Axent, x_Anat, y_Ainput_inv, is_training, n_Apredict_invar
 
 saver = tf.train.Saver(max_to_keep=3)
 var_main_encoder = trainable_in('main_encoder')
@@ -502,11 +507,9 @@ increment_global_step_op = tf.assign(
     name='global_step/assign'
 )
 
-from pgd_attack_GPU import LinfPGDAttackGPUImg
 model_VarList = x_Aadv, x_Aadv_attack, y_Ainput, is_training
 attack_gpu = LinfPGDAttackGPUImg(model_VarList, model, config['epsilon'], config['num_steps'], config['step_size'],
                                  config['random_start'], dataset_type, config)
-
 
 attack_mild = LinfPGDAttack(model_var_attack,
                             config['epsilon'],
@@ -516,16 +519,6 @@ attack_mild = LinfPGDAttack(model_var_attack,
                             config['loss_func'],
                             dataset_type
                             )  # TODO: without momentum
-
-# # TODO replace with new invariance attack class
-#                               )
-# attack_invariance = LinfPGDAttack(model_var_attack,
-#                               config['epsilon'],
-#                               strong_attack_config[0],
-#                               strong_attack_config[1],
-#                               config['random_start'],
-#                        'xent',
-#                               dataset_type
 
 attack_strong = LinfPGDAttack(model_var_attack,
                               config['epsilon'],
@@ -544,6 +537,13 @@ FGSM = LinfPGDAttack(model_var_attack,
                        'xent',
                        dataset_type
                        )  # TODO: without momentum
+
+
+model_VarList = x_Aadv_invar, x_Aadv_attack_invar, y_Ainput_invar, is_training
+attack_gpu_invar = InvarianceGPUAttack(model_VarList, model, config['epsilon'], config['num_steps'], config['step_size'], config['random_start'], dataset_type, config)
+attack_gpu_invar.fit(X=raw_dataset.train_data.xs, y=raw_dataset.train_data.ys)
+
+# import pdb; pdb.set_trace();
 
 if Use_B_Bp_A:
     targeted_gen = TargetedGen(
@@ -628,6 +628,7 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
 
   test_summary_writer = tf.summary.FileWriter(eval_dir+'_7PGD')
   test_summary_writer_20PGD = tf.summary.FileWriter(eval_dir + '_20PGD')
+  test_summary_writer_invar = tf.summary.FileWriter(eval_dir + '_invar')
   test_summary_writer_FGSM = tf.summary.FileWriter(eval_dir + '_FGSM')
   test_summary_writer_adv = tf.summary.FileWriter(eval_dir + '/adv')
   # TODO add summary writer for new attack
@@ -671,7 +672,7 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
         x_batch_adv, f_x4_adv_eval = attack_gpu.perturb(x_batch, y_batch, aux_mode_flag, sess)
 
         if use_invariance_attack:
-            x_batch_adv_invar, f_x4_adv_eval_invar = attack_gpu.perturb(x_batch, y_batch, aux_mode_flag, sess) # TODO change this to invariance attack here
+            x_batch_adv_invar, f_x4_adv_eval_invar = attack_gpu_invar.perturb(x_batch, y_batch, aux_mode_flag, sess) # TODO change this to invariance attack here
 
     elif args.diff_neg:
         assert mul_num<1
@@ -689,7 +690,6 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
                                                            multiple_passes=True)
         x_batch_adv, f_x4_adv_eval = attack_gpu.perturb(x_batch, y_batch, aux_mode_flag, sess)
         data_dict = {'x4': f_x4_adv_eval, 'label': y_batch}
-
 
         score = compute_vector_dist_toall_except_own(emb_dict, data_dict)
 
@@ -729,7 +729,7 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
         x_batch_adv, f_x4_adv_eval = attack_gpu.perturb(x_batch, y_batch, aux_mode_flag, sess)
 
         if use_invariance_attack:
-            x_batch_adv_invar, f_x4_adv_eval_invar = attack_gpu.perturb(x_batch, y_batch, aux_mode_flag, sess) # TODO change this to invariance attack here
+            x_batch_adv_invar, f_x4_adv_eval_invar = attack_gpu_invar.perturb(x_batch, y_batch, aux_mode_flag, sess) # TODO change this to invariance attack here
 
 
         debug=True
@@ -743,7 +743,7 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
         # t3 = timer()
 
         #calculate the most neg sample within this sample
-        score = compute_vector_dist_toall_except_own(emb_dict, data_dict) # TODO: this is interesting - what can we do with this?
+        score = compute_vector_dist_toall_except_own(emb_dict, data_dict) # TODO: this is interesting - what can we do with this? double check 
         most_similar_neg = np.argmax(score, axis=1)
         neg_image = emb_dict['raw'][most_similar_neg]
         neg_iamge_label = emb_dict['label'][most_similar_neg]
@@ -936,8 +936,8 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
                                         False, fp, dataset_type, attack_test=attack_strong)
 
 
-        # adv_acc_invariant = eval_in_train_invariance(config, model_var, raw_dataset, sess, global_step, test_summary_writer_20PGD,
-        #                                 False, fp, dataset_type, sensitivity_attack=attack_strong, invariance_attack=None)
+        adv_acc_invariant = eval_in_train_vanilla(config, model_var, raw_dataset, sess, global_step, test_summary_writer_invar,
+                                        False, fp, dataset_type, attack_test=attack_gpu_invar) #TODO: check that this is okay, and not another class needed
 
         print("model dir", model_dir)
         try:
@@ -969,3 +969,4 @@ end_time = time.time()
 print("TIME TAKEN (mins): {}".format((end_time - start_time) / 3600))
 
 print("avg mini time", mini_time * 1.0 / cnt_t, 'avg all time', all_time * 1.0 / cnt_t)
+
