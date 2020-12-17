@@ -4,7 +4,7 @@ import numpy as np
 import tensorflow as tf
 
 
-def eval_in_train_vanilla(config, model_varlist, dataset, sess, global_step, summary_writer, is_train, fp, dataset_type, test_natural=True, test_adversary=True, attack_test=None):
+def eval_in_train_vanilla(config, model_varlist, dataset, sess, global_step, summary_writer, is_train, fp, dataset_type, test_natural=True, test_adversary=True, attack_test=None, use_invariance_attack=False):
 
     def run_graph(x_batch, total_xent, total_corr, num_pos_examples, total_corr_pos):
         train_mix_dict = {x_Anat: x_batch.astype(np.float32),
@@ -70,6 +70,8 @@ def eval_in_train_vanilla(config, model_varlist, dataset, sess, global_step, sum
         x_batch = dataset.eval_data.xs[bstart:bend, :]
         y_batch = dataset.eval_data.ys[bstart:bend]
 
+        # import pdb; pdb.set_trace()        
+
         if dataset_type == 'drebin':
             x_batch = x_batch.toarray()
 
@@ -78,6 +80,10 @@ def eval_in_train_vanilla(config, model_varlist, dataset, sess, global_step, sum
 
         if test_adversary:
             x_batch_adv = attack_test.perturb(x_batch, y_batch, is_train, sess)
+
+            if use_invariance_attack: 
+                # only fetch the batch, not (batch, embedding)
+                x_batch_adv = x_batch_adv[0]
 
             total_xent_adv, total_corr_adv, num_pos_examples_adv, total_corr_pos_adv = run_graph(x_batch_adv, total_xent_adv, total_corr_adv, num_pos_examples_adv, total_corr_pos_adv)
 
@@ -135,6 +141,7 @@ def eval_in_train_multiGPUs(config, model_varlist, dataset, sess, global_step, s
       x_batch = dataset.eval_data.xs[bstart:bend, :]
       y_batch = dataset.eval_data.ys[bstart:bend]
 
+    #   import pdb; pdb.set_trace()
       if config['data_path'] == 'Drebin_data':
           x_batch = x_batch.toarray()
 

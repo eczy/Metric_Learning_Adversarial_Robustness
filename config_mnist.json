@@ -6,7 +6,7 @@
   "model_load_dir_other": "../load/mnist/",
 
   "_comment": "===== DATASET CONFIGURATION =====",
-  "data_path": "MNIST_data",
+  "data_path": "../MNIST_data",
 
   "_comment": "===== TRAINING CONFIGURATION =====",
   "tf_random_seed": 221760322,
@@ -50,6 +50,7 @@
   "Use_A_Ap_B": false,
   "Use_A1_Ap_B": true,
   "A1_Ap_B_num": 1,
+  "A1_Ap_B_invariance_num": 1,
   "Use_B_Bp_A": false,
   "triplet_loss_layers": ["x4"],
   "margin_list": [0.05],
@@ -81,5 +82,8 @@
   "attack_momentum": 0,
   "use_momentum": false,
 
-  "strong_attack": [100, 0.01]
+  "strong_attack": [100, 0.01],
+
+  "invariance_lambda": 0.5
 }
+

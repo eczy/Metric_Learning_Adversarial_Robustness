@@ -17,10 +17,12 @@ from learning.model_mnist_large import ModelMNIST
 from learning.model_imagenet_res50 import ModelImagenet
 
 from pgd_attack import LinfPGDAttack, TargetedGen
+from pgd_attack_GPU import LinfPGDAttackGPUImg, InvarianceGPUAttack
 from utils import trainable_in, remove_duplicate_node_from_list, triplet_loss_dict, visualize_imgs, mse_loss, \
     reshape_cal_len, compute_vector_dist_toall_except_own
 from learning.eval_within_train import eval_in_train_vanilla
 from utils import include_patterns
+import time
 
 slim = tf.contrib.slim
 
@@ -28,6 +30,7 @@ slim = tf.contrib.slim
 # Parse input parameters
 parser = argparse.ArgumentParser(description='Train Triplet')
 parser.add_argument('--dataset', dest='dataset', type=str, default='mnist', help='dataset to use')
+parser.add_argument('--use_invariance', action='store_true', help='use invariance attacks for TLA')
 parser.add_argument('--gpu', dest='gpu', type=int, default=1, help='num of gpus to use')
 parser.add_argument('--model-dir-postfix', dest='model_dir_postfix', type=str, default='', help='postfix added to directory holding the log')
 parser.add_argument('--train-size', dest='train_size', type=int, default=None, help='')
@@ -39,7 +42,9 @@ parser.add_argument('--use_lipschitz', action='store_true', help='use Lipschitz 
 
 
 args = parser.parse_args()
+use_invariance_attack = args.use_invariance
 
+print("***USING INVARIANCE ATTACKS: {} ***".format(use_invariance_attack))
 assert not (args.diff_neg and args.random_negative)
 
 config = None
@@ -81,6 +86,7 @@ Use_A1_Ap_B = config["Use_A1_Ap_B"]
 assert Use_A_Ap_B or Use_A1_Ap_B
 A1_Ap_B_num = config["A1_Ap_B_num"]
 assert 1 <= A1_Ap_B_num <= 5
+
 Use_B_Bp_A = config["Use_B_Bp_A"]
 triplet_loss_layers = config["triplet_loss_layers"] # ['x0', 'x1', 'x2', 'x3', 'x4', 'pre_softmax']
 assert len(triplet_loss_layers) > 0
@@ -95,13 +101,24 @@ nat_lam = config["nat_lam"]
 margin_mul = config["margin_mul"]
 print('margin_mul', margin_mul)
 
+
+# configs for invariance
+# use_invariance_attack = config["use_invariance_attack"]
+lamda_invariance = config["invariance_lambda"]
+
 # Note: current config set these parameters to be the same across layers. However, they can be customized for different layers.
-triplet_loss_margins = {layer_name:{'A_Ap_B':margin * margin_mul, 'A1_Ap_B_list':[margin for _ in range(A1_Ap_B_num)], 'B_Bp_A':margin} for layer_name, margin in zip(triplet_loss_layers, margin_list)}
+
+# print("config margins")
+# import pdb; pdb.set_trace()
+triplet_loss_margins = {layer_name: {'A_Ap_B':margin * margin_mul, 'A1_Ap_B_list':[margin for _ in range(A1_Ap_B_num)], 'A1_invariance_list': [margin for _ in range(A1_Ap_B_num)], 'B_Bp_A':margin} for layer_name, margin in zip(triplet_loss_layers, margin_list)}
 
 loss_coeffs = {'A':nat_lam/(A1_Ap_B_num+2), 'B':nat_lam/(A1_Ap_B_num+2),
                'A1_list':[nat_lam/(A1_Ap_B_num+2) for _ in range(A1_Ap_B_num)],
                'Ap':1, 'Bp':1, 'A_Ap_B':lamda_triplet,
-               'A1_Ap_B_list':[lamda_triplet for _ in range(A1_Ap_B_num)], 'B_Bp_A':lamda_triplet}
+               'A1_Ap_B_list':[lamda_triplet for _ in range(A1_Ap_B_num)],
+               'A1_invariance_list':[lamda_invariance for _ in range(A1_Ap_B_num)],
+               'A1_list_invariance':[nat_lam/(A1_Ap_B_num+2) for _ in range(A1_Ap_B_num)],
+               'B_Bp_A':lamda_triplet} #TODO why is A1_list_invariance divded by 2?
 
 add_noise_to_X = True if dataset_type != 'drebin' else False
 
@@ -178,6 +195,7 @@ if Use_A1_Ap_B:
 if Use_B_Bp_A:
     sub_folder_name += 'B_Bp_A'
 sub_folder_name += '_' + str(args.train_size)
+sub_folder_name += '_' + str(use_invariance_attack)
 model_dir = os.path.join(model_dir, sub_folder_name)
 
 
@@ -200,8 +218,9 @@ elif dataset_type == 'mnist':
     train_size = args.train_size
     test_size = None
     reprocess = True
-    raw_dataset = dataloader.mnist_input.MNISTData(data_path, dataset=dataset_type, train_size=train_size,
-                                                   test_size=test_size)
+
+    # import pdb; pdb.set_trace()
+    raw_dataset = dataloader.mnist_input.MNISTData(data_path, dataset=dataset_type, train_size=train_size, test_size=test_size)
     raw_dataset2 = dataloader.mnist_input.MNISTData(data_path, dataset=dataset_type, train_size=train_size,
                                                     test_size=test_size)
     cla_raw_cifar = dataloader.mnist_input.MNISTDataClassed(data_path, dataset=dataset_type, train_size=train_size,
@@ -226,9 +245,17 @@ elif dataset_type == 'imagenet':
 global_step = tf.train.get_or_create_global_step()
 
 
+# list of data insensitivity
 x_Anat_d_list = []
 A1_Ap_B_list = []
 
+# list of data invariance
+A1_invariance_list = []
+x_Anat_d_list_invar = []
+
+print("input shape")
+print(input_shape)
+## constructing adversarial training data
 with tf.variable_scope('input'):
 
     x_Anat = tf.placeholder(precision, shape=input_shape)
@@ -247,6 +274,20 @@ with tf.variable_scope('input'):
     y_Binput = tf.placeholder(tf.int64, shape=None)
     is_training = tf.placeholder(tf.bool, shape=None)
 
+    if use_invariance_attack:
+        x_Aadv_invar = tf.placeholder(precision, shape=input_shape)
+        x_Aadv_attack_invar = tf.placeholder(precision, shape=input_shape)
+        y_Ainput_invar = tf.placeholder(tf.int64, shape=None)
+
+        assert Use_A1_Ap_B # other triplet loss used in parallel
+        for i in range(A1_Ap_B_num):
+            x_Anat_d_list_invar.append(tf.placeholder(precision, shape=input_shape))
+
+
+
+
+# print("double check feature vectors")
+# import pdb; pdb.set_trace()
 ### Get feature vectors
 # A
 layer_values_A, n_Axent, n_Amean_xent, _, n_Anum_correct, n_Aaccuracy, n_Apredict, _ = \
@@ -265,20 +306,35 @@ if Use_B_Bp_A:
     layer_values_Bp, a_Bxent, a_Bmean_xent, a_Bweight_decay_loss, a_Bnum_correct, a_Baccuracy, a_Bpredict, a_Bmask = \
     model._encoder(x_Badv, y_Binput, is_training)
 
+# # A'' - invariance data
+
+if use_invariance_attack:
+    layer_values_Ap_invar, a_Axent_invar, a_Amean_xent_invar, a_Aweight_decay_loss_invar, a_Anum_correct_invar, a_Aaccuracy_invar, a_Apredict_invar, a_Amask_invar = \
+        model._encoder(x_Aadv_invar, y_Ainput_invar, is_training, mask_effective_attack=config['mask_effective_attack']) #TODO: check this
+
 # A1, A2, ...
 if Use_A1_Ap_B:
     for i in range(A1_Ap_B_num):
         layer_values_A1, _, n_Amean_xent_d, _, _, n_Aaccuracy_d, _, _ = \
-        model._encoder(x_Anat_d_list[i], y_Ainput, is_training)
+        model._encoder(x_Anat_d_list[i], y_Ainput, is_training) # encode images (X, y)
         A1_Ap_B_list.append({'layer_values_A1':layer_values_A1, 'n_Amean_xent_d':n_Amean_xent_d, 'n_Aaccuracy_d':n_Aaccuracy_d})
+
+if use_invariance_attack:
+    assert Use_A1_Ap_B, "A1_Ap_B is not true, must run same triplet config"
+    for i in range(A1_Ap_B_num): # should be doing same thing as normal A1_Ap_B
+        layer_values_A1_invar, _, n_Amean_xent_d_invar, _, _, n_Aaccuracy_d_invar, _, _ = \
+        model._encoder(x_Anat_d_list_invar[i], y_Ainput_invar, is_training)
+        A1_invariance_list.append({'layer_values_A1_invar':layer_values_A1_invar, 'n_Amean_xent_d_invar':n_Amean_xent_d_invar, 'n_Aaccuracy_d_invar':n_Aaccuracy_d_invar})
 
 
 
 ### Calculate triplet loss
 triplet_loss_data_A_Ap_B = dict()
 mse_loss_A_Ap = dict()
+mse_loss_A_invar = dict()
 mse_loss_A_B = dict()
 triplet_loss_data_A1_Ap_B_list = [dict() for _ in range(A1_Ap_B_num)]
+triplet_loss_data_invariance_list = [dict() for _ in range(A1_Ap_B_num)]
 # mse_loss_data_A1_Ap_B_list = [dict() for _ in range(A1_Ap_B_num)]
 
 triplet_loss_data_B_Bp_A = dict()
@@ -304,7 +360,7 @@ for layer_name in triplet_loss_layers:
         mse_loss_A_Ap[layer_name] = mse_loss(anchor, pos)
         mse_loss_A_B[layer_name] = mse_loss(anchor, neg)
         # We only add mse here to add the ALP.
-    if Use_A1_Ap_B:
+    if Use_A1_Ap_B: # TODO same config not sure what these are
         for i in range(A1_Ap_B_num):
             if switch_an_neg:
                 anchor = A1_Ap_B_list[i]['layer_values_A1'][layer_name]  # TODO: I've changed the a and p here
@@ -323,14 +379,50 @@ for layer_name in triplet_loss_layers:
         anchor = layer_values_Bp[layer_name]
         neg = layer_values_Ap[layer_name]
 
-        triplet_loss_data_B_Bp_A[layer_name] = triplet_loss_dict(anchor, pos, neg, triplet_loss_type, regularize_lambda, triplet_loss_margins[layer_name]['B_Bp_A'])
+        triplet_loss_data_B_Bp_A[layer_name] = triplet_loss_dict(anchor, pos, neg, triplet_loss_type, regularize_lambda, triplet_loss_margins[layer_name]['B_Bp_A'])\
+
+    #### invariance triplet layer ####
+    if use_invariance_attack:
+        assert Use_A1_Ap_B
+
+        for i in range(A1_Ap_B_num):
+            if switch_an_neg:
+                pos = layer_values_Ap_invar[layer_name]
+                anchor = A1_invariance_list[i]['layer_values_A1_invar'][layer_name]  # TODO: Double check this is okay
+            else:
+                pos = A1_invariance_list[i]['layer_values_A1_invar'][layer_name]
+                anchor = layer_values_Ap_invar[layer_name]
+            neg = layer_values_B[layer_name]
+
+            triplet_loss_data_invariance_list[i][layer_name] = triplet_loss_dict(anchor, pos, neg, triplet_loss_type,
+                                                regularize_lambda, triplet_loss_margins[layer_name]['A1_invariance_list'][i])
+            # mse_loss_data_A1_Ap_B_list[i][layer_name] = mse_loss(anchor, pos)
+
+
+        # # non perturbed mnist image of class x
+        # pos = A1_Ap_B_num[i]['layer_values_A1_invar'][layer_name]
+
+        # # perturbed mnist image of class x
+        # anchor = layer_values_Ap_invar[layer_name] # TODO change here
+
+        # # non perturbed mnist image of class y
+        # neg = layer_values_B[layer_name]
+
+        # triplet_loss_data_invariance_list[i][layer_name] = triplet_loss_dict(anchor, pos, neg, triplet_loss_type,
+        #                                 regularize_lambda, triplet_loss_margins[layer_name]['A1_invariance_list'][i])
 
 
 model_var_B_Bp_A = x_Anat, y_Ainput, x_Bnat, layer_values_A['x4'], layer_values_A['pre_softmax'], layer_values_B['x4'], layer_values_B['pre_softmax'], is_training
 model_var_attack = x_Aadv, a_Axent, y_Ainput, is_training, a_Aaccuracy
+
+if use_invariance_attack:
+    model_invariance_attack = x_Aadv_invar, a_Axent_invar, y_Ainput_invar, is_training, a_Aaccuracy_invar # TODO add?
 # model_var = n_Anum_correct, n_Axent, a_Anum_correct, a_Axent, x_Anat, x_Aadv, y_Ainput, is_training
 
+
+# TODO: confirm pass in natural examples 
 model_var = n_Anum_correct, n_Axent, x_Anat, y_Ainput, is_training, n_Apredict
+# model_invar = n_Anum_correct, n_Axent, x_Anat, y_Ainput_inv, is_training, n_Apredict_invar
 
 saver = tf.train.Saver(max_to_keep=3)
 var_main_encoder = trainable_in('main_encoder')
@@ -365,7 +457,7 @@ with tf.variable_scope('train/m_encoder_momentum'):
 
     total_loss = 0
     total_loss += weight_decay * a_Aweight_decay_loss
-    total_loss += loss_coeffs['Ap'] * a_Amean_xent
+    total_loss += loss_coeffs['Ap'] * a_Amean_xent # why is this added? i see some a * CE(x, x')
 
     for layer_name in triplet_loss_layers:
         if Use_A_Ap_B:
@@ -374,23 +466,34 @@ with tf.variable_scope('train/m_encoder_momentum'):
         if Use_A1_Ap_B:
             for i in range(A1_Ap_B_num):
                 total_loss += loss_coeffs['A1_Ap_B_list'][i] * triplet_loss_data_A1_Ap_B_list[i][layer_name]['triplet_loss']
+
         if Use_B_Bp_A:
             total_loss += loss_coeffs['Bp'] * a_Bmean_xent
             total_loss += loss_coeffs['B_Bp_A'] * triplet_loss_data_B_Bp_A[layer_name]['triplet_loss']
+
+        if use_invariance_attack:
+            for i in range(A1_Ap_B_num): #TODO make flexible
+                total_loss += loss_coeffs['A1_invariance_list'][i] * triplet_loss_data_invariance_list[i][layer_name]['triplet_loss']
 
     # Set coefficients associated to natural values to 0
     if train_flag_adv_only:
         loss_coeffs['A'] = 0
         loss_coeffs['B'] = 0
         for i in range(A1_Ap_B_num):
-            loss_coeffs['A1_list'][i] = 0
+            loss_coeffs['A1_list'][i] = 0 #TODO what is this doing?
+            loss_coeffs['A1_list_invariance'][i] = 0
     else:
         total_loss += loss_coeffs['A'] * n_Amean_xent
         total_loss += loss_coeffs['B'] * n_Bmean_xent
 
     if Use_A1_Ap_B:
         for i in range(A1_Ap_B_num):
-            total_loss += loss_coeffs['A1_list'][i] * A1_Ap_B_list[i]['n_Amean_xent_d']
+            total_loss += loss_coeffs['A1_list'][i] * A1_Ap_B_list[i]['n_Amean_xent_d'] #TODO what is this doing?
+
+    if use_invariance_attack:
+        assert Use_A1_Ap_B
+        for i in range(A1_Ap_B_num):
+            total_loss += loss_coeffs['A1_list_invariance'][i] * A1_invariance_list[i]['n_Amean_xent_d_invar'] #TODO what is this doing?
 
     encoder_opt = None
     if optimizer == "SGD":
@@ -411,11 +514,9 @@ increment_global_step_op = tf.assign(
     name='global_step/assign'
 )
 
-from pgd_attack_GPU import LinfPGDAttackGPUImg
 model_VarList = x_Aadv, x_Aadv_attack, y_Ainput, is_training
 attack_gpu = LinfPGDAttackGPUImg(model_VarList, model, config['epsilon'], config['num_steps'], config['step_size'],
                                  config['random_start'], dataset_type, config)
-
 
 attack_mild = LinfPGDAttack(model_var_attack,
                             config['epsilon'],
@@ -444,6 +545,14 @@ FGSM = LinfPGDAttack(model_var_attack,
                        dataset_type
                        )  # TODO: without momentum
 
+
+if use_invariance_attack:
+    model_VarList = x_Aadv_invar, x_Aadv_attack_invar, y_Ainput_invar, is_training
+    attack_gpu_invar = InvarianceGPUAttack(model_VarList, model, config['epsilon'], config['num_steps'], config['step_size'], config['random_start'], dataset_type, config)
+    attack_gpu_invar.fit(X=raw_dataset.train_data.xs, y=raw_dataset.train_data.ys)
+
+# import pdb; pdb.set_trace();
+
 if Use_B_Bp_A:
     targeted_gen = TargetedGen(
         model_var_B_Bp_A,
@@ -461,6 +570,11 @@ if Use_A_Ap_B:
     tf.summary.scalar('A Ap MSE last', mse_loss_A_Ap[triplet_loss_layers[0]])
     tf.summary.scalar('pos neg MSE ratio', mse_loss_A_Ap[triplet_loss_layers[0]] / mse_loss_A_B[triplet_loss_layers[0]])
 
+# if use_invariance_attack:
+#     tf.summary.scalar('pred_adv_invar accuracy', a_Aaccuracy_invar)
+    # tf.summary.scalar('pred_adv xent', n_Amean_xent_d_invar / batch_size) # TODO diff between n_Amean_xent_d_invar and non d?
+
+
 for layer_name in triplet_loss_layers:
     if Use_A_Ap_B:
         tf.summary.scalar('Triplet loss A', triplet_loss_data_A_Ap_B[layer_name]['triplet_loss'])
@@ -469,6 +583,9 @@ for layer_name in triplet_loss_layers:
     if Use_A1_Ap_B:
         for i in range(A1_Ap_B_num):
             tf.summary.scalar('Triplet loss nat A 1 with index '+str(i), triplet_loss_data_A1_Ap_B_list[i][layer_name]['triplet_loss'])
+    if use_invariance_attack:
+        for i in range(A1_Ap_B_num):
+            tf.summary.scalar('Triplet loss nat invariance 1 with index '+str(i), triplet_loss_data_invariance_list[i][layer_name]['triplet_loss'])
 
 tf.summary.scalar('lr', learning_rate)
 merged_summaries = tf.summary.merge_all()
@@ -519,13 +636,16 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
 
   test_summary_writer = tf.summary.FileWriter(eval_dir+'_7PGD')
   test_summary_writer_20PGD = tf.summary.FileWriter(eval_dir + '_20PGD')
+  test_summary_writer_invar = tf.summary.FileWriter(eval_dir + '_invar')
   test_summary_writer_FGSM = tf.summary.FileWriter(eval_dir + '_FGSM')
   test_summary_writer_adv = tf.summary.FileWriter(eval_dir + '/adv')
+  # TODO add summary writer for new attack
 
   test_summary_writer_list = [test_summary_writer, test_summary_writer_adv]
 
   sess.run(tf.global_variables_initializer())
 
+  start_time = time.time()
   print("model dir", model_dir)
 
   if is_finetune:
@@ -548,12 +668,19 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
   cnt_t = 0
   mini_time = 0
   all_time = 0
+
+#   print("Sanity check set trace")
+#   import pdb; pdb.set_trace()
+
   for ii in range(max_num_training_steps):
 
     if args.random_negative:
         neg_image, neg_iamge_label = cifar_emb.train_data.get_next_batch(batch_size, multiple_passes=True)
         x_batch, y_batch = cifar.train_data.get_next_batch(batch_size, multiple_passes=True)
         x_batch_adv, f_x4_adv_eval = attack_gpu.perturb(x_batch, y_batch, aux_mode_flag, sess)
+
+        if use_invariance_attack:
+            x_batch_adv_invar, f_x4_adv_eval_invar = attack_gpu_invar.perturb(x_batch, y_batch, aux_mode_flag, sess) # TODO change this to invariance attack here
 
     elif args.diff_neg:
         assert mul_num<1
@@ -571,7 +698,6 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
                                                            multiple_passes=True)
         x_batch_adv, f_x4_adv_eval = attack_gpu.perturb(x_batch, y_batch, aux_mode_flag, sess)
         data_dict = {'x4': f_x4_adv_eval, 'label': y_batch}
-
 
         score = compute_vector_dist_toall_except_own(emb_dict, data_dict)
 
@@ -610,23 +736,29 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
         assert x_batch.dtype != 'uint8'
         x_batch_adv, f_x4_adv_eval = attack_gpu.perturb(x_batch, y_batch, aux_mode_flag, sess)
 
+        if use_invariance_attack:
+            x_batch_adv_invar, f_x4_adv_eval_invar = attack_gpu_invar.perturb(x_batch, y_batch, aux_mode_flag, sess) # TODO change this to invariance attack here
+
+
         debug=True
         if debug:
             print('diff', np.max(np.abs(x_batch_adv - x_batch)))
 
+        data_dict = {'x4': f_x4_adv_eval,  'label': y_batch} # TODO: how does this impact observations  #'x4_invar': f_x4_adv_eval_invar,
 
-
-        data_dict = {'x4': f_x4_adv_eval, 'label': y_batch}
+        if use_invariance_attack:
+            data_dict.update({'x4_invar': f_x4_adv_eval_invar})
         # t3 = timer()
 
         #calculate the most neg sample within this sample
-        score = compute_vector_dist_toall_except_own(emb_dict, data_dict)
+        score = compute_vector_dist_toall_except_own(emb_dict, data_dict) # TODO: this is interesting - what can we do with this? double check 
         most_similar_neg = np.argmax(score, axis=1)
         neg_image = emb_dict['raw'][most_similar_neg]
         neg_iamge_label = emb_dict['label'][most_similar_neg]
 
     # t4 = timer()
     x_batch_A1_list = []
+    x_batch_A1_list_invar = []
     imgs_to_visualize = [x_batch, x_batch_adv]
 
     # Get B
@@ -650,12 +782,25 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
         temp = np.random.uniform(-nat_noise_level, nat_noise_level, x_batch.shape)
         x_batch = np.clip(np.rint(x_batch + temp), 0, 255)
 
+
+    if use_invariance_attack:
+        imgs_to_visualize.append(x_batch_adv_invar)
+
+        assert Use_A1_Ap_B, "not using the same triplet config"
+
+        for i in range(A1_Ap_B_num):  ## am i still using this?
+            x_batch_3, y_batch_3 = cifar_aux.train_data.get_next_data_basedon_class(y_batch)
+            x_batch_A1_list_invar.append(x_batch_3)
+            imgs_to_visualize.append(x_batch_3)
+
     # from utils import visualize_imgs
     # visualize_imgs('/home/mcz/AdvPlot/', imgs_to_visualize, img_ind=ii) #TODO: only for debug
 
     # print('clean max', np.amax(x_batch))
     # print('adv max', np.amax(x_batch_adv))
 
+
+    # training set up for running
     train_mix_dict = {x_Anat: x_batch.astype(np.float32),
                       x_Aadv: x_batch_adv.astype(np.float32),
                       y_Ainput: y_batch,
@@ -671,20 +816,28 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
                            is_training: aux_mode_flag}
 
     if Use_A1_Ap_B:
-        for i in range(A1_Ap_B_num):
+        for i in range(A1_Ap_B_num): # TODO I think? batch number
             train_mix_dict[x_Anat_d_list[i]] = x_batch_A1_list[i].astype(np.float32)
             train_mix_dict_eval[x_Anat_d_list[i]] = x_batch_A1_list[i].astype(np.float32)
     if Use_B_Bp_A:
         train_mix_dict[x_Badv] = x_batch_neg.astype(np.float32)
         train_mix_dict_eval[x_Badv] = x_batch_neg.astype(np.float32)
 
-    # t5 = timer()
+    if use_invariance_attack:
+        train_mix_dict.update({x_Aadv_invar: x_batch_adv_invar.astype(np.float32), y_Ainput_invar: y_batch})
+        train_mix_dict_eval.update({x_Aadv_invar: x_batch_adv_invar.astype(np.float32), y_Ainput_invar: y_batch})
 
+        assert Use_A1_Ap_B, "not running same triplet loss base config"
+        for i in range(A1_Ap_B_num): # TODO I think? batch number
+            train_mix_dict[x_Anat_d_list_invar[i]] = x_batch_A1_list_invar[i].astype(np.float32)
+            train_mix_dict_eval[x_Anat_d_list_invar[i]] = x_batch_A1_list_invar[i].astype(np.float32)
+
+    # t5 = timer()
 
     if ii % num_output_steps == 0:
 
         ### Run session to get values
-        values_to_run = [n_Aaccuracy, a_Aaccuracy, n_Amean_xent, a_Amean_xent]
+        values_to_run = [n_Aaccuracy, a_Aaccuracy, n_Amean_xent, a_Amean_xent] # TODO: double check this is ok for adding a_Aaccuracy_invar, a_Amean_xent_invar, a_Aaccuracy_invar, a_Amean_xent_invar
 
         if Use_B_Bp_A:
             values_to_run.append(a_Baccuracy)
@@ -702,12 +855,19 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
                                       triplet_loss_data_A_Ap_B[layer_name]['neg_dist'],
                                       triplet_loss_data_A_Ap_B[layer_name]['norm']])
 
-            if Use_A1_Ap_B:
+            if Use_A1_Ap_B: # TODO this is WHERE WE'RE RUNNING IT
                 for i in range(A1_Ap_B_num):
                     values_to_run.extend([triplet_loss_data_A1_Ap_B_list[i][layer_name]['triplet_loss'],
                                           triplet_loss_data_A1_Ap_B_list[i][layer_name]['pos_dist'],
                                           triplet_loss_data_A1_Ap_B_list[i][layer_name]['neg_dist'],
                                           triplet_loss_data_A1_Ap_B_list[i][layer_name]['norm']])
+
+            if use_invariance_attack: # TODO this is WHERE WE'RE RUNNING IT
+                for i in range(A1_Ap_B_num):
+                    values_to_run.extend([triplet_loss_data_invariance_list[i][layer_name]['triplet_loss'],
+                                          triplet_loss_data_invariance_list[i][layer_name]['pos_dist'],
+                                          triplet_loss_data_invariance_list[i][layer_name]['neg_dist'],
+                                          triplet_loss_data_invariance_list[i][layer_name]['norm']])
             if Use_A_Ap_B:
                 values_to_run.extend([mse_loss_A_Ap[layer_name]])
 
@@ -718,13 +878,15 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
 
         ### Print related values
 
-        nat_acc, adv_acc, nat_xent_value, adv_xent_value = values[0:4]
+        nat_acc, adv_acc, nat_xent_value, adv_xent_value, adv_acc_invar, adv_xent_value_invar = values[0:6]
 
         str1 = 'Step {}:    ({})\n'.format(ii, datetime.now()) \
                + 'training nat accuracy {:.4}%\n'.format(nat_acc * 100) \
                + 'training adv accuracy {:.4}%\n'.format(adv_acc * 100) \
+               + 'training adv accuracy invariance {:.4}%\n'.format(adv_acc_invar * 100) \
                + 'training nat xent {:.4}\n'.format(nat_xent_value) \
-               + 'training adv xent {:.4}\n'.format(adv_xent_value)
+               + 'training adv xent {:.4}\n'.format(adv_xent_value) \
+               + 'training adv xent invariance {:.4}%\n'.format(adv_xent_value_invar * 100)
         if Use_B_Bp_A:
             a_Baccuracy_value = sess.run(a_Baccuracy, feed_dict=train_mix_dict_eval)
             str1 += 'Bp adv accuracy {:.4}%\n'.format(a_Baccuracy_value * 100)
@@ -738,7 +900,7 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
                 type_name_list.append(layer_name+'_B_Bp_A')
             if Use_A1_Ap_B:
                 for i in range(A1_Ap_B_num):
-                    type_name_list.append(layer_name+'_A1_Ap_B_'+str(i))
+                    type_name_list.append(layer_name+'_A1_Ap_B_'+str(i)) # TODO: do we need to add another layer here? I don't think so
 
         start_ind = 4
         if Use_B_Bp_A:
@@ -764,18 +926,28 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
 
     if ii % num_summary_steps == 0:
         summary = sess.run(merged_summaries, feed_dict=train_mix_dict_eval)
+
         summary_writer_adv.add_summary(summary, global_step.eval(sess))
 
     if ii % num_checkpoint_steps == 0 and ii > 0 or is_finetune and ii == 0:
         print('-' * 10, 'FGSM', '-' * 10)
         _ = eval_in_train_vanilla(config, model_var, raw_dataset, sess, global_step, test_summary_writer_FGSM,
                                   False, fp, dataset_type, attack_test=FGSM)
+
+        # print("past eval!")
+        # import pdb; pdb.set_trace();
         # print('-' * 10, '7PGD', '-' * 10)
         # _ = eval_in_train_vanilla(config, model_var, raw_dataset, sess, global_step, test_summary_writer_list[0],
         #                           False, fp, dataset_type, attack_test=attack_mild)
         print('-' * 10, '20PGD', '-' * 10)
         adv_acc = eval_in_train_vanilla(config, model_var, raw_dataset, sess, global_step, test_summary_writer_20PGD,
                                         False, fp, dataset_type, attack_test=attack_strong)
+
+
+        if use_invariance_attack: 
+            print('-' * 10, 'Invariance Attack', '-' * 10)
+            adv_acc_invariant = eval_in_train_vanilla(config, model_var, raw_dataset, sess, global_step, test_summary_writer_invar,
+                                        False, fp, dataset_type, attack_test=attack_gpu_invar, use_invariance_attack=True) #TODO: check that this is okay, and not another class needed
 
         print("model dir", model_dir)
         try:
@@ -790,6 +962,9 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
         if dataset_type != 'drebin':
             visualize_imgs(image_dir, imgs_to_visualize, ii)
 
+
+    # print("about to step")
+    # import pdb; pdb.set_trace()
     sess.run([increment_global_step_op, train_step_m_encoder], feed_dict=train_mix_dict)
     t_finish = timer()
 
@@ -799,5 +974,9 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:  #
 
 
 
+end_time = time.time()
+
+print("TIME TAKEN (mins): {}".format((end_time - start_time) / 3600))
 
 print("avg mini time", mini_time * 1.0 / cnt_t, 'avg all time', all_time * 1.0 / cnt_t)
+
